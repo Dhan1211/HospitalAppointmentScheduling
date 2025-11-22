@@ -1,231 +1,194 @@
+
 import streamlit as st
 import mysql.connector
 from datetime import datetime
 
-# Database connection setup
-def create_connection():
-    conn = mysql.connector.connect(
-        host="localhost",  # Replace with your database host
-        user="root",       # Replace with your database user
-        password="Dhan",   # Replace with your database password
-        database="hospitaldb"  # Replace with your database name
-    )
-    return conn
+class Database:
+    def __init__(self):
+        self.conn = mysql.connector.connect(
+            host="localhost",
+            user="root",
+            password="Dhan",
+            database="hospitaldb"
+        )
+        self.cursor = self.conn.cursor(dictionary=True)
 
-# Function to check if a student is eligible for a free consultation
-def is_student_eligible(roll_number):
-    conn = create_connection()
-    cursor = conn.cursor()
-    query = "SELECT * FROM Patients WHERE SRN = %s"
-    cursor.execute(query, (roll_number,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
+    def execute(self, query, params=None):
+        self.cursor.execute(query, params or ())
+        return self.cursor
 
-# Fetch doctors from the database
-def get_doctors():
-    conn = create_connection()
-    cursor = conn.cursor()
-    query = "SELECT DoctorID, Name FROM Doctors"  # Fetch DoctorID and Name from Doctors table
-    cursor.execute(query)
-    doctors = cursor.fetchall()
-    conn.close()
-    return doctors
+    def commit(self):
+        self.conn.commit()
 
-# Function to check if a slot is available for booking
-def is_slot_available(doctor_id, appointment_date, appointment_time):
-    conn = create_connection()
-    cursor = conn.cursor()
+    def close(self):
+        self.cursor.close()
+        self.conn.close()
 
-    query = """
-    SELECT 
-        CASE 
-            WHEN COUNT(*) < max_slots THEN 'Available' 
-            ELSE 'Not Available' 
-        END AS Slot_Status
-    FROM (
-        SELECT COUNT(*) AS max_slots
-        FROM Appointments
-        WHERE DoctorID = %s AND AppointmentDate = %s AND AppointmentTime = %s
-    ) AS slot_count
-    JOIN (
-        SELECT AvailableDate, StartTime, EndTime
-        FROM Schedule 
-        WHERE DoctorID = %s
-        AND AvailableDate = %s 
-        AND StartTime <= %s AND EndTime >= %s
-    ) AS doctor_schedule ON 1 = 1
-    GROUP BY slot_count.max_slots, doctor_schedule.AvailableDate, doctor_schedule.StartTime, doctor_schedule.EndTime
-    """
-    
-    cursor.execute(query, (doctor_id, appointment_date, appointment_time, doctor_id, appointment_date, appointment_time, appointment_time))
-    result = cursor.fetchone()
-    conn.close()
+class Patient:
+    def __init__(self, patient_id, roll_number=None):
+        self.patient_id = patient_id
+        self.roll_number = roll_number
 
-    if result and result['Slot_Status'] == 'Available':
-        return True
-    return False
+    def is_student_eligible(self, db: Database):
+        query = "SELECT * FROM Patients WHERE SRN = %s"
+        cursor = db.execute(query, (self.roll_number,))
+        result = cursor.fetchone()
+        return result is not None
 
-# Booking an appointment with waitlist functionality
-def book_appointment(patient_id, doctor_name, appointment_date, appointment_time, specialization):
-    conn = create_connection()
-    cursor = conn.cursor()
-    
-    # If a doctor is selected, get the DoctorID based on the doctor's Name
-    if doctor_name:
+class Doctor:
+    @staticmethod
+    def get_doctors(db: Database):
+        query = "SELECT DoctorID, Name FROM Doctors"
+        cursor = db.execute(query)
+        return cursor.fetchall()
+
+    @staticmethod
+    def get_doctor_id_by_name(db: Database, name):
         query = "SELECT DoctorID FROM Doctors WHERE Name = %s"
-        cursor.execute(query, (doctor_name,))
+        cursor = db.execute(query, (name,))
         doctor_row = cursor.fetchone()
-        
-        if doctor_row:
-            doctor_id = doctor_row[0]  # Extract DoctorID from the result
-        else:
+        return doctor_row["DoctorID"] if doctor_row else None
+
+class Appointment:
+    @staticmethod
+    def is_slot_available(db: Database, doctor_id, appointment_date, appointment_time):
+        query = """
+        SELECT 
+            CASE 
+                WHEN COUNT(*) < max_slots THEN 'Available' 
+                ELSE 'Not Available' 
+            END AS Slot_Status
+        FROM (
+            SELECT COUNT(*) AS max_slots
+            FROM Appointments
+            WHERE DoctorID = %s AND AppointmentDate = %s AND AppointmentTime = %s
+        ) AS slot_count
+        JOIN (
+            SELECT AvailableDate, StartTime, EndTime
+            FROM Schedule 
+            WHERE DoctorID = %s
+            AND AvailableDate = %s 
+            AND StartTime <= %s AND EndTime >= %s
+        ) AS doctor_schedule ON 1 = 1
+        GROUP BY slot_count.max_slots, doctor_schedule.AvailableDate, doctor_schedule.StartTime, doctor_schedule.EndTime
+        """
+        cursor = db.execute(query, (doctor_id, appointment_date, appointment_time, doctor_id, appointment_date, appointment_time, appointment_time))
+        result = cursor.fetchone()
+        return result and result.get('Slot_Status') == 'Available'
+
+    @staticmethod
+    def book(db: Database, patient_id, doctor_name, appointment_date, appointment_time, specialization):
+        doctor_id = Doctor.get_doctor_id_by_name(db, doctor_name) if doctor_name else None
+        if doctor_name and not doctor_id:
             st.error(f"Doctor {doctor_name} not found in the database.")
             return
-    else:
-        doctor_id = None  # No doctor selected
-    
-    # Check if slot is available using the new query
-    if is_slot_available(doctor_id, appointment_date, appointment_time):
-        # Book the appointment
-        query = """
-        INSERT INTO Appointments (PatientID, DoctorID, AppointmentDate, AppointmentTime)
-        VALUES (%s, %s, %s, %s)
-        """
-        cursor.execute(query, (patient_id, doctor_id, appointment_date, appointment_time))
-        st.success("Appointment booked successfully!")
-    else:
-        # Add to waitlist
-        query = """
-        INSERT INTO Waitlist (PatientID, DoctorID, AppointmentDate, AppointmentTime, Status)
-        VALUES (%s, %s, %s, %s, 'Waiting')
-        """
-        cursor.execute(query, (patient_id, doctor_id, appointment_date, appointment_time))
-        st.warning("No slots available. Added to waitlist.")
-    
-    conn.commit()
-    conn.close()
-
-# Function to collect feedback for any appointment ID
-def collect_feedback(patient_id, appointment_id):
-    conn = create_connection()
-    cursor = conn.cursor()
-
-    # Check if the feedback has already been provided for this appointment
-    query = "SELECT * FROM Feedback WHERE AppointmentID = %s AND PatientID = %s"
-    cursor.execute(query, (appointment_id, patient_id))
-    feedback = cursor.fetchone()
-
-    if feedback:
-        st.info("Feedback has already been provided for this appointment.")
-    else:
-        # Provide the feedback form
-        st.subheader("Please provide your feedback for Appointment ID: " + appointment_id)
-        rating = st.slider("Rating (1 to 5)", 1, 5, 3)  # 1-5 rating scale
-        comments = st.text_area("Comments", "")
-
-        if st.button("Submit Feedback"):
-            # Insert the feedback into the database
-            feedback_query = """
-            INSERT INTO Feedback (PatientID, AppointmentID, Rating, Comments)
+        if Appointment.is_slot_available(db, doctor_id, appointment_date, appointment_time):
+            query = """
+            INSERT INTO Appointments (PatientID, DoctorID, AppointmentDate, AppointmentTime)
             VALUES (%s, %s, %s, %s)
             """
-            cursor.execute(feedback_query, (patient_id, appointment_id, rating, comments))
-            conn.commit()
+            db.execute(query, (patient_id, doctor_id, appointment_date, appointment_time))
+            st.success("Appointment booked successfully!")
+        else:
+            query = """
+            INSERT INTO Waitlist (PatientID, DoctorID, AppointmentDate, AppointmentTime, Status)
+            VALUES (%s, %s, %s, %s, 'Waiting')
+            """
+            db.execute(query, (patient_id, doctor_id, appointment_date, appointment_time))
+            st.warning("No slots available. Added to waitlist.")
+        db.commit()
 
-            # Optionally, we can log a success message or inform the user that the feedback has been submitted
-            st.success("Thank you for your feedback! Your feedback has been submitted.")
-    
-    conn.close()
+    @staticmethod
+    def cancel(db: Database, appointment_id):
+        query = "SELECT DoctorID, AppointmentDate, AppointmentTime FROM Appointments WHERE AppointmentID = %s"
+        cursor = db.execute(query, (appointment_id,))
+        appointment = cursor.fetchone()
+        if appointment:
+            doctor_id = appointment["DoctorID"]
+            appointment_date = appointment["AppointmentDate"]
+            appointment_time = appointment["AppointmentTime"]
+            update_query = """
+            UPDATE Appointments
+            SET AppointmentDate = NULL, AppointmentTime = NULL
+            WHERE AppointmentID = %s
+            """
+            db.execute(update_query, (appointment_id,))
+            schedule_query = """
+            INSERT INTO Schedule (DoctorID, AvailableDate, StartTime, EndTime)
+            VALUES (%s, %s, %s, %s)
+            """
+            db.execute(schedule_query, (doctor_id, appointment_date, appointment_time, appointment_time))
+            db.commit()
+            st.success(f"Appointment {appointment_id} has been successfully canceled and the slot is returned to the schedule.")
+        else:
+            st.error("Appointment ID not found or already canceled.")
 
-# Procedure to cancel an appointment
-def cancel_appointment(appointment_id):
-    conn = create_connection()
-    cursor = conn.cursor()
+class Feedback:
+    @staticmethod
+    def collect(db: Database, patient_id, appointment_id):
+        query = "SELECT * FROM Feedback WHERE AppointmentID = %s AND PatientID = %s"
+        cursor = db.execute(query, (appointment_id, patient_id))
+        feedback = cursor.fetchone()
+        if feedback:
+            st.info("Feedback has already been provided for this appointment.")
+        else:
+            st.subheader(f"Please provide your feedback for Appointment ID: {appointment_id}")
+            rating = st.slider("Rating (1 to 5)", 1, 5, 3)
+            comments = st.text_area("Comments", "")
+            if st.button("Submit Feedback"):
+                feedback_query = """
+                INSERT INTO Feedback (PatientID, AppointmentID, Rating, Comments)
+                VALUES (%s, %s, %s, %s)
+                """
+                db.execute(feedback_query, (patient_id, appointment_id, rating, comments))
+                db.commit()
+                st.success("Thank you for your feedback! Your feedback has been submitted.")
 
-    # Get the doctor's details and appointment time
-    query = "SELECT DoctorID, AppointmentDate, AppointmentTime FROM Appointments WHERE AppointmentID = %s"
-    cursor.execute(query, (appointment_id,))
-    appointment = cursor.fetchone()
-
-    if appointment:
-        doctor_id, appointment_date, appointment_time = appointment
-        
-        # Update the appointment status to cancelled
-        update_query = """
-        UPDATE Appointments
-        SET AppointmentDate = NULL, AppointmentTime = NULL
-        WHERE AppointmentID = %s
-        """
-        cursor.execute(update_query, (appointment_id,))
-        
-        # Add the appointment slot back to the doctor's schedule
-        schedule_query = """
-        INSERT INTO Schedule (DoctorID, AvailableDate, StartTime, EndTime)
-        VALUES (%s, %s, %s, %s)
-        """
-        cursor.execute(schedule_query, (doctor_id, appointment_date, appointment_time, appointment_time))
-
-        conn.commit()
-        st.success(f"Appointment {appointment_id} has been successfully canceled and the slot is returned to the schedule.")
-    else:
-        st.error("Appointment ID not found or already canceled.")
-    
-    conn.close()
-
-# Patient interface
+# Streamlit UI
 st.header("Book an Appointment, Provide Feedback, or Cancel an Appointment")
+db = Database()
 
-# User inputs for booking
+# Booking
 patient_id = st.text_input("Enter Patient ID")
-doctor_name_list = get_doctors()
-doctor_names = [doctor[1] for doctor in doctor_name_list]  # Extracting doctor names
+doctor_name_list = Doctor.get_doctors(db)
+doctor_names = [doctor["Name"] for doctor in doctor_name_list]
 doctor_name = st.selectbox("Choose Doctor (optional)", doctor_names + ["None"])
-
-# Specialization is required
-specializations = ["Cardiology", "Orthopedics", "Pediatrics", "Neurology"]  # Adjust this list as needed
+specializations = ["Cardiology", "Orthopedics", "Pediatrics", "Neurology"]
 specialization = st.selectbox("Choose Specialization", specializations)
-
 appointment_date = st.date_input("Select Appointment Date")
 appointment_time = st.time_input("Select Appointment Time")
 roll_number = st.text_input("Enter Roll Number if you are a student (for free consultation)")
 
-# Check if student is eligible for free consultation
 if roll_number:
-    if is_student_eligible(roll_number):
+    patient = Patient(patient_id, roll_number)
+    if patient.is_student_eligible(db):
         st.write("Student eligible for free consultation.")
     else:
         st.write("Consultation fee applies.")
 
-# Book appointment on button click
 if st.button("Book Appointment"):
     if patient_id and specialization and appointment_date and appointment_time:
-        # Pass doctor_name (which can be None) and specialization to the booking function
-        book_appointment(patient_id, doctor_name if doctor_name != "None" else None, appointment_date, appointment_time, specialization)
+        Appointment.book(db, patient_id, doctor_name if doctor_name != "None" else None, appointment_date, appointment_time, specialization)
     else:
         st.error("Please fill in all fields to book an appointment.")
 
-# Collect feedback for completed appointment
+# Feedback
 st.subheader("Provide Feedback for an Appointment")
+feedback_patient_id = st.text_input("Enter Patient ID for feedback")
+feedback_appointment_id = st.text_input("Enter Appointment ID to provide feedback")
+if st.button("Submit Feedback"):
+    if feedback_patient_id and feedback_appointment_id:
+        Feedback.collect(db, feedback_patient_id, feedback_appointment_id)
+    else:
+        st.error("Please enter both Patient ID and Appointment ID to provide feedback.")
 
-# User inputs for feedback
-appointment_id = st.text_input("Enter Appointment ID to provide feedback")
-
-# Collect feedback on button click
-if patient_id and appointment_id:
-    collect_feedback(patient_id, appointment_id)
-else:
-    st.error("Please enter both Patient ID and Appointment ID to provide feedback.")
-
-# Cancel an appointment
+# Cancel Appointment
 st.subheader("Cancel an Appointment")
-
-# User inputs for canceling an appointment
 cancel_appointment_id = st.text_input("Enter Appointment ID to cancel")
-
-# Cancel appointment on button click
-if cancel_appointment_id:
-    if st.button("Cancel Appointment"):
-        cancel_appointment(cancel_appointment_id)
+if st.button("Cancel Appointment"):
+    if cancel_appointment_id:
+        Appointment.cancel(db, cancel_appointment_id)
     else:
         st.error("Please enter a valid Appointment ID to cancel.")
+
+db.close()
